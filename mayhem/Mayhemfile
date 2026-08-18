@@ -1,0 +1,30 @@
+project: savantenvs/lci
+target: lci
+
+cmds:
+  # In-process libFuzzer harness over the lci LOLCODE pipeline -- scanBuffer ->
+  # tokenizeLexemes -> parseMainNode -> interpretMainNodeScope (lexer, tokenizer,
+  # parser, and the tree-walking VM/bindings) -- the same code path the archived
+  # `lci @@` CLI drove on an input file, but instrumented (the raw CLI carried no
+  # coverage -> 0 edges) and with the interpreter's host-facing primitives (file,
+  # process, socket) neutered at build time. See mayhem/fuzz_lci.c and
+  # mayhem/harness_stubs.c.
+  - cmd: /mayhem/build/lci
+    libfuzzer: true
+    dictionary: /mayhem/mayhem/lci/lci.dict
+    # Both values below are exactly what Mayhem's own auto-resolution selected on run #4
+    # ("Auto-resolution managed to find Mayhemfile parameter values that resolve problems
+    # ... { cmd.timeout: 30, cmd.env.MFUZZ_COMPAT_LEVEL: 2 }"), which the event log then asks
+    # be set explicitly in the Mayhemfile. On run #4 Regression Testing smoketested SUCCESSFULLY
+    # (the interpreter step budget fixed the accumulated-corpus hang) but Behavior Testing still
+    # failed its 5-iteration probe and the phase died a second after auto-resolution proposed
+    # these, so they are pinned here rather than left to be rediscovered each run.
+    # 30s is generous on purpose: it only bounds a single exec, and the in-harness 50,000-statement
+    # budget (mayhem/build.sh) is what actually stops unbounded LOLCODE loops.
+    timeout: 30
+    env:
+      MFUZZ_COMPAT_LEVEL: '2'
+
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/lci/testsuite
