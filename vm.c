@@ -1639,9 +1639,12 @@ static ValueObject *mutableReg(ValueObject **regs, unsigned int a)
 {
 	ValueObject *v = regs[a];
 	if (v) {
+		/* Named rather than excluded, so that a value type added later
+		 * gets a fresh object instead of having whatever it points at
+		 * quietly overwritten. */
 		if (v->semaphore == 1
-				&& v->type != VT_STRING
-				&& v->type != VT_ARRAY)
+				&& (v->type == VT_INTEGER || v->type == VT_BOOLEAN
+					|| v->type == VT_FLOAT || v->type == VT_NIL))
 			return v;
 		deleteValueObject(v);
 	}

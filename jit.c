@@ -1433,8 +1433,18 @@ static int generate(Proto *p, TypeMap *m, Gen *g)
  */
 /**@{*/
 
-static void *jitmem = NULL;
-static size_t jitmemsize = 0;
+/**
+ * The regions holding generated code.  A process may compile more than once --
+ * an interactive session compiles each statement it reads -- so they are kept
+ * in a list rather than a single pointer.
+ */
+typedef struct jitregion {
+	struct jitregion *next; /**< The previously allocated region. */
+	void *mem;              /**< The region itself. */
+	size_t size;            /**< Its length. */
+} JitRegion;
+
+static JitRegion *jitregions = NULL;
 
 /**
  * Every procedure compiled to machine code, so that they can be freed.
@@ -1591,7 +1601,7 @@ void jitCompileAll(Proto **protos, unsigned int num)
 
 	if (total) {
 		size_t size = (total + 4095) & ~(size_t)4095;
-		jitmem = allocExecutable(size);
+		void *jitmem = allocExecutable(size);
 		if (!jitmem) {
 			/* Without executable memory everything simply runs on the
 			 * virtual machine. */
@@ -1600,7 +1610,13 @@ void jitCompileAll(Proto **protos, unsigned int num)
 		else {
 			unsigned char *out = jitmem;
 			unsigned int off = 0;
-			jitmemsize = size;
+			JitRegion *region = malloc(sizeof(JitRegion));
+			if (region) {
+				region->mem = jitmem;
+				region->size = size;
+				region->next = jitregions;
+				jitregions = region;
+			}
 			beginWriting();
 			for (n = 0; n < num; n++) {
 				if (!protos[n]->jitcode) continue;
@@ -1703,9 +1719,12 @@ ValueObject *jitCall(Proto *proto, ValueObject **args, unsigned int numargs)
 
 void jitFree(void)
 {
-	if (jitmem) munmap(jitmem, jitmemsize);
-	jitmem = NULL;
-	jitmemsize = 0;
+	while (jitregions) {
+		JitRegion *next = jitregions->next;
+		munmap(jitregions->mem, jitregions->size);
+		free(jitregions);
+		jitregions = next;
+	}
 }
 /**@}*/
 
