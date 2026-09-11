@@ -275,6 +275,9 @@ IdentifierNode *createIdentifierNode(IdentifierType type,
 	p->type = type;
 	p->id = id;
 	p->slot = slot;
+	/* Direct identifiers are interned once here so that every later lookup
+	 * is a pointer comparison instead of a strcmp against a fresh copy. */
+	p->iname = (type == IT_DIRECT && id) ? internName((const char *)id) : NULL;
 	if (fname) {
 		p->fname = malloc(sizeof(char) * (strlen(fname) + 1));
 		strcpy(p->fname, fname);
@@ -1045,6 +1048,7 @@ FuncDefStmtNode *createFuncDefStmtNode(IdentifierNode *scope,
 	p->name = name;
 	p->args = args;
 	p->body = body;
+	p->proto = NULL;
 	return p;
 }
 

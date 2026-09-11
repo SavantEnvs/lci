@@ -209,6 +209,7 @@
 #include <float.h>
 
 #include "tokenizer.h"
+#include "intern.h"
 
 #undef DEBUG
 
@@ -293,6 +294,7 @@ typedef struct identifiernode {
 	char *fname;                 /**< The original file name. */
 	unsigned int line;           /**< The original line number. */
 	struct identifiernode *slot; /**< The slot to access. */
+	const Name *iname;           /**< Interned \a id, for \ref IT_DIRECT only. */
 } IdentifierNode;
 
 /**
@@ -355,6 +357,7 @@ typedef struct {
 	IdentifierNode *name;     /**< The name of the function. */
 	IdentifierNodeList *args; /**< The names of the function arguments. */
 	BlockNode *body;          /**< The body of the function. */
+	void *proto;              /**< The compiled \ref Proto, if any. */
 } FuncDefStmtNode;
 
 /**

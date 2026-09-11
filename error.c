@@ -147,6 +147,10 @@ static const char *err_msgs[] = {
 	"%s:%u: function name already used by existing variable at: %s\n",
 	/* IN_CANNOT_CAST_VALUE_TO_ARRAY */
 	"%s:%u: cannot cast value to array at: %s\n",
+	/* IN_INVALID_OPCODE */
+	"Invalid opcode\n",
+	/* IN_RECURSION_TOO_DEEP */
+	"Recursion too deep\n",
 };
 
 static const int err_codes[] = {
@@ -183,10 +187,11 @@ static const int err_codes[] = {
 	415, /* PR_CANNOT_USE_STR_AS_LITERAL */
 	416, /* PR_LITERAL_MUST_BE_UNIQUE */
 	417, /* PR_EXPECTED_LOOP_NAME */
-	418, /* PR_EXPECTED_ONE_OF */
+	418, /* PR_EXPECTED_EITHER_TOKEN */
 	419, /* PR_EXPECTED_UNARY_FUNCTION */
 	420, /* PR_EXPECTED_MATCHING_LOOP_NAME */
 	421, /* PR_EXPECTED_STATEMENT */
+	422, /* PR_UNHANDLED_STRING */
 
 	/* The 500 block is for the interpreter */
 	500, /* IN_INVALID_IDENTIFIER_TYPE */
@@ -229,6 +234,8 @@ static const int err_codes[] = {
 	537, /* IN_INVALID_TYPE */
 	538, /* IN_FUNCTION_NAME_USED_BY_VARIABLE */
 	539, /* IN_CANNOT_CAST_VALUE_TO_ARRAY */
+	540, /* IN_INVALID_OPCODE */
+	541, /* IN_RECURSION_TOO_DEEP */
 };
 
 void error(ErrorType e, ...)

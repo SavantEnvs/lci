@@ -28,6 +28,9 @@ SET(HDRS
   tokenizer.h
   unicode.h
   error.h
+  intern.h
+  vm.h
+  jit.h
 )
 
 SET(SRCS
@@ -38,9 +41,20 @@ SET(SRCS
   tokenizer.c
   unicode.c
   error.c
+  intern.c
+  vm.c
+  jit.c
 )
   
 add_executable(lci ${SRCS} ${HDRS})
+
+# Link time optimisation lets the machine inline across its own source files.
+include(CheckCCompilerFlag)
+check_c_compiler_flag("-flto" HAVE_FLTO)
+if(HAVE_FLTO)
+  target_compile_options(lci PRIVATE $<$<CONFIG:Release>:-flto>)
+  target_link_options(lci PRIVATE $<$<CONFIG:Release>:-flto>)
+endif()
 target_link_libraries(lci m)
 add_subdirectory(test)
 install(

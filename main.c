@@ -114,6 +114,7 @@
 #include "tokenizer.h"
 #include "parser.h"
 #include "interpreter.h"
+#include "vm.h"
 #include "error.h"
 
 #define READSIZE 512
@@ -141,6 +142,7 @@ static void version (char *revision) {
 
 int main(int argc, char **argv)
 {
+	initStackGuard();
 	unsigned int size = 0;
 	unsigned int length = 0;
 	char *buffer = NULL;
@@ -249,6 +251,8 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		deleteMainNode(node);
+		freeProtos();
+		freeObjectPools();
 		/* End main pipeline */
 
 	}
