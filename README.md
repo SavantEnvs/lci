@@ -10,8 +10,8 @@ to be correct, portable, fast, and precisely documented.
 - **Portable**: lci follows the widely ported ANSI C specification allowing it
   to compile on a broad range of systems.
 
-- **Fast**: Much effort has gone into producing simple and efficient code
-  whenever possible to the extent that the above points are not compromised.
+- **Fast**: Programs are compiled to bytecode and, where their types can be
+  pinned down, on to machine code. See [Performance](#performance).
 
 - **Precisely documented**: lci uses Doxygen to generate literate code
   documentation, browsable here.
@@ -32,7 +32,8 @@ Created and maintained by Justin J. Meza (http://justinmeza.com).
 1. [CMake](http://www.cmake.org) (if using a Linux distro with package
    management, CMake should be in your repositories).
 
-2. Python 2.7+ or Python 2.x with the argparse module installed.
+2. Python, for the test driver. Python 3 is preferred; the build looks for
+   `python3`, then `python`.
 
 ### The Easy Way (Linux / macOS)
 
@@ -59,6 +60,75 @@ To enable memory testing:
 ```
 $ cmake -DPERFORM_MEM_TESTS:BOOL=ON .
 ```
+
+## Performance
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.png">
+  <img src="assets/benchmarks.png" alt="Run time of six LOLCODE benchmarks under lci before and after the execution engine, lulz, and CPython." width="100%">
+</picture>
+
+Measured on an Apple M2 Max, best of several runs, process start-up included.
+"Tree-walking" is lci as it was before the execution engine described below;
+[lulz](https://github.com/MonliH/lulz) 0.1.1 compiles LOLCODE to Lua and runs it
+on LuaJIT; the CPython column runs an equivalent Python program, as
+[lulz's own benchmark](https://github.com/MonliH/lulz/tree/master/perfs) does.
+
+| benchmark | lci, tree-walking | lci, VM + JIT | speed-up | lulz 0.1.1 | CPython 3.14 |
+|---|--:|--:|--:|--:|--:|
+| hello world | 1.9 ms | 1.9 ms | 1x | 2.6 ms | 17.8 ms |
+| fib(30) | 1,682.4 ms | 5.4 ms | 309x | 17.5 ms | 105.1 ms |
+| ackermann(3,7) | 3,745.9 ms | 4.7 ms | 789x | 5.7 ms | 44.7 ms |
+| loop 5M | 1,531.8 ms | 65.7 ms | 23x | n/a | 378.5 ms |
+| string build 20k | 189.1 ms | 91.3 ms | 2x | n/a | 22.5 ms |
+| BF interpreter | 19.4 ms | 9.2 ms | 2x | n/a | n/a |
+
+For scale, the same fib(30) written in C and compiled with `-O2` takes 5.0 ms on
+this machine. `n/a` means the implementation does not accept a construct the
+program uses: lulz 0.1.1 does not implement `IM IN YR ... UPPIN YR` loops,
+`SMOOSH`, or `SMALLR OF`/`BIGGR OF`. String building is the one benchmark lci
+loses: `SMOOSH` copies the whole string each time round the loop, where CPython
+grows its buffer in place.
+
+### How it runs a program
+
+A program passes through as many of three stages as it can, and drops back a
+stage whenever the next one cannot represent what it needs to do. All three
+share one set of semantics, one representation of values, and one kind of scope
+object, so a procedure running in one stage can call a procedure running in
+another.
+
+1. **A tree-walking interpreter** (`interpreter.c`) still defines what every
+   construct means, and still runs anything the other two stages decline —
+   bindings to C libraries among them.
+
+2. **A register machine** (`vm.c`) compiles the parse tree into bytecode once,
+   resolving names to registers or to scope slots ahead of time. LOLCODE is
+   dynamically scoped — a function called with `I IZ` runs with its caller's
+   scope as its parent — so a whole-program analysis first works out which names
+   no procedure ever reads from outside the one that declares them. Only those
+   become registers. A construct the analysis does not recognise leaves every
+   name in its scope object, so adding to the language costs speed rather than
+   correctness.
+
+3. **A code generator** (`jit.c`) compiles a procedure to AArch64 or x86-64
+   machine code when a dataflow pass can prove that every value it handles is an
+   integer or a boolean. Knowing the types statically means the generated code
+   carries no tags, allocates nothing, and tests nothing at run time; the one
+   check happens on entry, where a caller whose arguments do not match falls back
+   to stage 2. Targets other than those two, and systems that refuse to make
+   memory executable, run stages 1 and 2.
+
+Deep recursion is reported rather than run into the ground: all three stages
+check the remaining stack and stop with "Recursion too deep".
+
+Three environment variables help when working on the engine:
+
+| variable | effect |
+|---|---|
+| `LCI_NOJIT=1` | skip stage 3 and run everything on the register machine |
+| `LCI_DUMP=1` | print each procedure's bytecode, and whether it reached stage 3 |
+| `LCI_DUMP_ASM=<file>` | write the generated machine code out for a disassembler |
 
 ## Standard Library
 

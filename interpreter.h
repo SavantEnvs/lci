@@ -116,13 +116,22 @@ typedef struct returnobject {
 /**
  * Stores a set of variables hierarchically.
  */
+/**
+ * The number of values a scope may hold before it builds a hash index.  Below
+ * this, a linear scan of interned name pointers is faster than hashing.
+ */
+#define SCOPE_LINEAR_MAX 8
+
 typedef struct scopeobject {
 	struct scopeobject *parent; /**< The parent scope. */
 	struct scopeobject *caller; /**< The caller scope (if in a function). */
 	ValueObject *impvar;        /**< The \ref impvar "implicit variable". */
 	unsigned int numvals;       /**< The number of values in the scope. */
-	char **names;               /**< The names of the values. */
+	const Name **names;         /**< The interned names of the values. */
 	ValueObject **values;       /**< The values in the scope. */
+	unsigned int cap;           /**< Allocated length of \a names and \a values. */
+	unsigned int idxcap;        /**< Size of \a index; zero when unused. */
+	int *index;                 /**< Open-addressed name to slot index. */
 } ScopeObject;
 
 /**
@@ -132,9 +141,28 @@ typedef struct scopeobject {
  */
 /**@{*/
 void printInterpreterError(const char *, IdentifierNode *, ScopeObject *);
+void freeObjectPools(void);
+void initStackGuard(void);
+extern char *stackFloor;
+
+/**
+ * Whether the C stack is close enough to exhausted that recursing again is
+ * unsafe.
+ */
+static inline int stackExhausted(void)
+{
+	char marker;
+	return stackFloor && &marker < stackFloor;
+}
+ValueObject *readLineValue(void);
+ValueObject *callFunctionValues(FuncDefStmtNode *, ValueObject **, unsigned int, ScopeObject *);
+extern unsigned int scopeVersion;
+int findScopeSlot(ScopeObject *, const Name *);
+int appendScopeSlot(ScopeObject *, const Name *);
 char *copyString(char *);
 unsigned int isHexString(const char *);
 char *resolveIdentifierName(IdentifierNode *, ScopeObject *);
+const Name *resolveIdentifierIName(IdentifierNode *, ScopeObject *);
 int resolveTerminalSlot(ScopeObject *, ScopeObject *, IdentifierNode *, ScopeObject **, IdentifierNode **);
 /**@}*/
 
@@ -152,8 +180,9 @@ ValueObject *createStringValueObject(char *);
 ValueObject *createFunctionValueObject(FuncDefStmtNode *);
 ValueObject *createArrayValueObject(ScopeObject *);
 ValueObject *createBlobValueObject(void *);
-ValueObject *copyValueObject(ValueObject *);
-void deleteValueObject(ValueObject *);
+void freeValueObjectSlow(ValueObject *);
+ValueObject *refillValuePool(void);
+extern ValueObject *valuepool;
 /**@}*/
 
 /**
@@ -198,6 +227,11 @@ ValueObject *castBooleanExplicit(ValueObject *, ScopeObject *);
 ValueObject *castIntegerExplicit(ValueObject *, ScopeObject *);
 ValueObject *castFloatExplicit(ValueObject *, ScopeObject *);
 ValueObject *castStringExplicit(ValueObject *, ScopeObject *);
+ValueObject *applyArithOp(OpType, ValueObject *, ValueObject *, ScopeObject *);
+ValueObject *applyEqualityOp(OpType, ValueObject *, ValueObject *, ScopeObject *);
+int valueIsTrue(ValueObject *, ScopeObject *, int *);
+ValueObject *concatValues(ValueObject **, unsigned int, ScopeObject *);
+int switchMatches(ValueObject *, ValueObject *);
 /**@}*/
 
 /**
@@ -396,5 +430,63 @@ ValueObject *opNeqStringString(ValueObject *, ValueObject *);
 ValueObject *opEqNilNil(ValueObject *, ValueObject *);
 ValueObject *opNeqNilNil(ValueObject *, ValueObject *);
 /**@}*/
+
+/**
+ * \name Value fast paths
+ *
+ * These run several times for every instruction the machine executes, so they
+ * are defined here rather than being called across a translation unit.
+ */
+/**@{*/
+
+/**
+ * Takes another reference to a value.
+ */
+static inline ValueObject *copyValueObjectInline(ValueObject *value)
+{
+	value->semaphore++;
+	return value;
+}
+
+/**
+ * Drops a reference to a value, freeing it when the last one goes.
+ */
+static inline void deleteValueObjectInline(ValueObject *value)
+{
+	if (!value) return;
+	if (--value->semaphore == 0) freeValueObjectSlow(value);
+}
+
+/**
+ * Allocates an uninitialised value with a single reference.
+ */
+static inline ValueObject *newValueObject(void)
+{
+	ValueObject *p = valuepool;
+	if (!p) {
+		p = refillValuePool();
+		if (!p) return NULL;
+	}
+	else valuepool = *(ValueObject **)p;
+	p->semaphore = 1;
+	return p;
+}
+
+/**
+ * Reduces a value to the truth of its contents, without a call for the types
+ * that need no conversion.
+ */
+static inline int valueIsTrueInline(ValueObject *val, ScopeObject *scope, int *ok)
+{
+	if (val->type == VT_BOOLEAN || val->type == VT_INTEGER) {
+		*ok = 1;
+		return val->data.i != 0;
+	}
+	return valueIsTrue(val, scope, ok);
+}
+/**@}*/
+
+#define copyValueObject(v) copyValueObjectInline(v)
+#define deleteValueObject(v) deleteValueObjectInline(v)
 
 #endif /* __INTERPRETER_H__ */

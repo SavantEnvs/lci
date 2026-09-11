@@ -275,6 +275,9 @@ IdentifierNode *createIdentifierNode(IdentifierType type,
 	p->type = type;
 	p->id = id;
 	p->slot = slot;
+	/* Direct identifiers are interned once here so that every later lookup
+	 * is a pointer comparison instead of a strcmp against a fresh copy. */
+	p->iname = (type == IT_DIRECT && id) ? internName((const char *)id) : NULL;
 	if (fname) {
 		p->fname = malloc(sizeof(char) * (strlen(fname) + 1));
 		strcpy(p->fname, fname);
@@ -1055,6 +1058,7 @@ FuncDefStmtNode *createFuncDefStmtNode(IdentifierNode *scope,
 	p->name = name;
 	p->args = args;
 	p->body = body;
+	p->proto = NULL;
 	return p;
 }
 
@@ -1487,6 +1491,7 @@ int acceptToken(Token ***tokenp,
                 TokenType token)
 {
 	Token **tokens = *tokenp;
+	if (!(*tokens)) return 0;
 	if ((*tokens)->type != token) return 0;
 	tokens++;
 	*tokenp = tokens;
@@ -1549,7 +1554,11 @@ int nextToken(Token ***tokenp,
 void parser_error(ErrorType type,
                   Token **tokens)
 {
-	error(type, (*tokens)->fname, (*tokens)->line, (*tokens)->image);
+	if (!(*tokens)) {
+		error(PR_UNHANDLED_STRING);
+	} else {
+		error(type, (*tokens)->fname, (*tokens)->line, (*tokens)->image);
+	}
 }
 
 /**

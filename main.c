@@ -4,7 +4,7 @@
  * \section license License
  *
  * lci - a LOLCODE interpreter written in C.
- * Copyright (C) 2010-2012 Justin J. Meza
+ * Copyright (C) 2010-2014 Justin J. Meza
  *
  * This program is free software: you can redistribute it and/or modify it under
  * the terms of the GNU General Public License as published by the Free Software
@@ -116,6 +116,7 @@
 #include "tokenizer.h"
 #include "parser.h"
 #include "interpreter.h"
+#include "vm.h"
 #include "error.h"
 
 #define READSIZE 512
@@ -173,6 +174,7 @@ int pipeline(char *buffer, unsigned int length, const char *fname, ScopeObject *
 
 int main(int argc, char **argv)
 {
+	initStackGuard();
 	unsigned int size = 0;
 	unsigned int length = 0;
 	char *buffer = NULL;
@@ -230,6 +232,8 @@ int main(int argc, char **argv)
 					}
 					free(buffer);
 					deleteScopeObject(scope);
+					freeProtos();
+					freeObjectPools();
 					exit(EXIT_SUCCESS);
 				}
 		}
@@ -310,7 +314,15 @@ int main(int argc, char **argv)
 			printf("%c%c%c", 0xef, 0xbb, 0xbf);
 		}
 
-		return pipeline(buffer, length, fname, NULL);
+		{
+			/* The pools outlive the pipeline, which the interactive
+			 * loop runs once per statement, so they are released
+			 * here rather than inside it. */
+			int status = pipeline(buffer, length, fname, NULL);
+			freeProtos();
+			freeObjectPools();
+			return status;
+		}
 
 	}
 

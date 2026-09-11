@@ -1,4 +1,8 @@
+#include <sys/time.h>
+#include <sys/resource.h>
+
 #include "interpreter.h"
+#include "vm.h"
 
 /**
  * Creates a new string by copying the contents of another string.
@@ -122,6 +126,362 @@ resolveIdentifierNameAbort: /* Exception handline */
 }
 
 /**
+ * \name Stack guard
+ *
+ * Recursion in a LOLCODE program becomes recursion in the interpreter, so a
+ * runaway program used to take the process down with a segmentation fault.
+ * Recording how much stack there is at start up lets every path -- the tree
+ * walking interpreter, the virtual machine and generated code -- notice it is
+ * running out and report the problem instead.
+ */
+/**@{*/
+
+char *stackFloor = NULL;
+
+/**
+ * The margin left below the floor, enough to report an error and unwind.
+ */
+#define STACK_MARGIN (256 * 1024)
+
+void initStackGuard(void)
+{
+	char marker;
+	size_t size = 8 * 1024 * 1024;
+#ifdef RLIMIT_STACK
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_STACK, &rl) == 0
+			&& rl.rlim_cur != RLIM_INFINITY
+			&& rl.rlim_cur > STACK_MARGIN * 2)
+		size = (size_t)rl.rlim_cur;
+#endif
+	if (size <= STACK_MARGIN * 2) size = STACK_MARGIN * 4;
+	stackFloor = &marker - (size - STACK_MARGIN);
+}
+/**@}*/
+
+/**
+ * \name Object pools
+ *
+ * Values and return records are created and destroyed several times per
+ * expression evaluated and used to be individually malloc'd, which dominated
+ * run time.  They are uniformly sized, so they are carved out of block
+ * allocations and recycled through free lists instead.
+ */
+/**@{*/
+
+/**
+ * The number of objects carved out of the system allocator at a time.
+ */
+#define POOL_BLOCK 1024
+
+/**
+ * Tracks a block allocation so that it can be released at exit.
+ */
+typedef struct poolblock {
+	struct poolblock *next; /**< The previously allocated block. */
+	void *mem;              /**< The block itself. */
+} PoolBlock;
+
+static PoolBlock *poolblocks = NULL;
+unsigned int scopeVersion = 1;
+ValueObject *valuepool = NULL;
+static ReturnObject *returnpool = NULL;
+
+/**
+ * Records \a mem so that \ref freeObjectPools can release it.
+ */
+static void trackPoolBlock(void *mem)
+{
+	PoolBlock *b = malloc(sizeof(PoolBlock));
+	if (!b) {
+		perror("malloc");
+		return;
+	}
+	b->mem = mem;
+	b->next = poolblocks;
+	poolblocks = b;
+}
+
+/**
+ * Takes a value off of the value free list, refilling it if it is empty.
+ */
+static ValueObject *allocValueObject(void)
+{
+	ValueObject *p = valuepool;
+	ValueObject *block;
+	unsigned int n;
+
+	if (p) {
+		valuepool = *(ValueObject **)p;
+		return p;
+	}
+
+	block = malloc(sizeof(ValueObject) * POOL_BLOCK);
+	if (!block) {
+		perror("malloc");
+		return NULL;
+	}
+	trackPoolBlock(block);
+	/* Hand back the first object and thread the rest onto the free list. */
+	for (n = 1; n < POOL_BLOCK - 1; n++)
+		*(ValueObject **)(block + n) = block + n + 1;
+	*(ValueObject **)(block + POOL_BLOCK - 1) = NULL;
+	valuepool = block + 1;
+	return block;
+}
+
+/**
+ * Allocates an uninitialised value with a single reference.
+ *
+ * \return A value whose type and data the caller must set.
+ */
+ValueObject *refillValuePool(void)
+{
+	return allocValueObject();
+}
+
+/**
+ * Returns a value to the value free list.
+ */
+static void recycleValueObject(ValueObject *p)
+{
+	*(ValueObject **)p = valuepool;
+	valuepool = p;
+}
+
+/**
+ * Takes a return record off of the return free list, refilling it if it is
+ * empty.
+ */
+static ReturnObject *allocReturnObject(void)
+{
+	ReturnObject *p = returnpool;
+	ReturnObject *block;
+	unsigned int n;
+
+	if (p) {
+		returnpool = *(ReturnObject **)p;
+		return p;
+	}
+
+	block = malloc(sizeof(ReturnObject) * POOL_BLOCK);
+	if (!block) {
+		perror("malloc");
+		return NULL;
+	}
+	trackPoolBlock(block);
+	for (n = 1; n < POOL_BLOCK - 1; n++)
+		*(ReturnObject **)(block + n) = block + n + 1;
+	*(ReturnObject **)(block + POOL_BLOCK - 1) = NULL;
+	returnpool = block + 1;
+	return block;
+}
+
+/**
+ * Returns a return record to the return free list.
+ */
+static void recycleReturnObject(ReturnObject *p)
+{
+	*(ReturnObject **)p = returnpool;
+	returnpool = p;
+}
+
+/**
+ * Releases every block the pools have taken from the system allocator.
+ *
+ * \post No value or return object remains valid.
+ */
+void freeObjectPools(void)
+{
+	while (poolblocks) {
+		PoolBlock *next = poolblocks->next;
+		free(poolblocks->mem);
+		free(poolblocks);
+		poolblocks = next;
+	}
+	valuepool = NULL;
+	returnpool = NULL;
+}
+/**@}*/
+
+/**
+ * \name Scope name index
+ *
+ * A scope holds its values in insertion order in dense parallel arrays.  Small
+ * scopes -- nearly all of them -- are searched by scanning those arrays and
+ * comparing interned name pointers, which is quicker than hashing.  A scope
+ * that grows past \ref SCOPE_LINEAR_MAX also maintains an open-addressed index
+ * from name to slot so that lookups in large scopes stay constant time.
+ */
+/**@{*/
+
+/**
+ * Rebuilds \a scope's name index, sizing it for the current contents.
+ */
+static void reindexScope(ScopeObject *scope)
+{
+	unsigned int cap = 16;
+	unsigned int n;
+
+	while (cap < scope->numvals * 2) cap *= 2;
+	free(scope->index);
+	scope->index = malloc(sizeof(int) * cap);
+	if (!scope->index) {
+		perror("malloc");
+		/* Fall back to scanning; correctness does not depend on the index. */
+		scope->idxcap = 0;
+		return;
+	}
+	memset(scope->index, -1, sizeof(int) * cap);
+	scope->idxcap = cap;
+	for (n = 0; n < scope->numvals; n++) {
+		unsigned int i = scope->names[n]->hash & (cap - 1);
+		while (scope->index[i] != -1) i = (i + 1) & (cap - 1);
+		scope->index[i] = (int)n;
+	}
+}
+
+/**
+ * Finds the slot holding \a name in \a scope alone, ignoring its parents.
+ *
+ * \retval -1 \a name is not present in \a scope.
+ */
+int findScopeSlot(ScopeObject *scope, const Name *name)
+{
+	unsigned int n;
+
+	if (scope->idxcap) {
+		unsigned int mask = scope->idxcap - 1;
+		unsigned int i = name->hash & mask;
+		int slot;
+		while ((slot = scope->index[i]) != -1) {
+			if (scope->names[slot] == name) return slot;
+			i = (i + 1) & mask;
+		}
+		return -1;
+	}
+
+	for (n = 0; n < scope->numvals; n++)
+		if (scope->names[n] == name) return (int)n;
+	return -1;
+}
+
+/**
+ * Appends \a name to \a scope, bound to a new nil value.
+ *
+ * \return The slot the name was placed in.
+ *
+ * \retval -1 Memory allocation failed.
+ */
+int appendScopeSlot(ScopeObject *scope, const Name *name)
+{
+	if (scope->numvals == scope->cap) {
+		unsigned int newcap = scope->cap ? scope->cap * 2 : 4;
+		void *mem = realloc(scope->names, sizeof(Name *) * newcap);
+		if (!mem) {
+			perror("realloc");
+			return -1;
+		}
+		scope->names = mem;
+		mem = realloc(scope->values, sizeof(ValueObject *) * newcap);
+		if (!mem) {
+			perror("realloc");
+			return -1;
+		}
+		scope->values = mem;
+		scope->cap = newcap;
+	}
+
+	scopeVersion++;
+	scope->names[scope->numvals] = name;
+	scope->values[scope->numvals] = createNilValueObject();
+	if (!scope->values[scope->numvals]) return -1;
+	scope->numvals++;
+
+	if (scope->idxcap) {
+		if (scope->numvals * 2 > scope->idxcap) {
+			reindexScope(scope);
+		}
+		else {
+			unsigned int mask = scope->idxcap - 1;
+			unsigned int i = name->hash & mask;
+			while (scope->index[i] != -1) i = (i + 1) & mask;
+			scope->index[i] = (int)(scope->numvals - 1);
+		}
+	}
+	else if (scope->numvals > SCOPE_LINEAR_MAX) {
+		reindexScope(scope);
+	}
+
+	return (int)(scope->numvals - 1);
+}
+/**@}*/
+
+/**
+ * The interned name of the calling object reference variable, resolved once.
+ */
+static const Name *nameME = NULL;
+
+/**
+ * Returns the interned name \c ME.
+ */
+static const Name *getNameME(void)
+{
+	if (!nameME) nameME = internName("ME");
+	return nameME;
+}
+
+/**
+ * Resolves an identifier to an interned name.
+ *
+ * Unlike \ref resolveIdentifierName this allocates nothing for the common
+ * case of a direct identifier, which was interned when it was parsed.
+ *
+ * \param [in] id The identifier to resolve.
+ *
+ * \param [in] scope The scope to evaluate an indirect identifier under.
+ *
+ * \return The interned name \a id refers to.
+ *
+ * \retval NULL \a id could not be resolved.
+ */
+const Name *resolveIdentifierIName(IdentifierNode *id,
+                                   ScopeObject *scope)
+{
+	ValueObject *val = NULL;
+	ValueObject *str = NULL;
+	const Name *ret = NULL;
+
+	if (!id) return NULL;
+
+	if (id->type == IT_DIRECT) return id->iname;
+
+	if (id->type == IT_INDIRECT) {
+		ExprNode *expr = (ExprNode *)(id->id);
+
+		/* Interpret the identifier expression */
+		val = interpretExprNode(expr, scope);
+		if (!val) return NULL;
+
+		/* Then cast it to a string */
+		str = castStringExplicit(val, scope);
+		deleteValueObject(val);
+		if (!str) return NULL;
+
+		ret = internName(getString(str));
+		deleteValueObject(str);
+		return ret;
+	}
+
+	{
+		char *name = resolveIdentifierName(id, scope);
+		error(IN_INVALID_IDENTIFIER_TYPE, id->fname, id->line, name);
+		if (name) free(name);
+	}
+	return NULL;
+}
+
+/**
  * Creates a nil-type value.
  *
  * \return A new nil-type value.
@@ -130,7 +490,7 @@ resolveIdentifierNameAbort: /* Exception handline */
  */
 ValueObject *createNilValueObject(void)
 {
-	ValueObject *p = malloc(sizeof(ValueObject));
+	ValueObject *p = allocValueObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -151,7 +511,7 @@ ValueObject *createNilValueObject(void)
  */
 ValueObject *createBooleanValueObject(int data)
 {
-	ValueObject *p = malloc(sizeof(ValueObject));
+	ValueObject *p = allocValueObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -173,7 +533,7 @@ ValueObject *createBooleanValueObject(int data)
  */
 ValueObject *createIntegerValueObject(long long data)
 {
-	ValueObject *p = malloc(sizeof(ValueObject));
+	ValueObject *p = allocValueObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -195,7 +555,7 @@ ValueObject *createIntegerValueObject(long long data)
  */
 ValueObject *createFloatValueObject(float data)
 {
-	ValueObject *p = malloc(sizeof(ValueObject));
+	ValueObject *p = allocValueObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -219,7 +579,7 @@ ValueObject *createFloatValueObject(float data)
  */
 ValueObject *createStringValueObject(char *data)
 {
-	ValueObject *p = malloc(sizeof(ValueObject));
+	ValueObject *p = allocValueObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -241,7 +601,7 @@ ValueObject *createStringValueObject(char *data)
  */
 ValueObject *createFunctionValueObject(FuncDefStmtNode *def)
 {
-	ValueObject *p = malloc(sizeof(ValueObject));
+	ValueObject *p = allocValueObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -265,7 +625,7 @@ ValueObject *createFunctionValueObject(FuncDefStmtNode *def)
  */
 ValueObject *createArrayValueObject(ScopeObject *parent)
 {
-	ValueObject *p = malloc(sizeof(ValueObject));
+	ValueObject *p = allocValueObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -320,11 +680,6 @@ ValueObject *createBlobValueObject(void *data)
  *
  * \retval NULL The type of \a value is unrecognized.
  */
-ValueObject *copyValueObject(ValueObject *value)
-{
-	V(value);
-	return value;
-}
 
 /**
  * Deletes a value.
@@ -340,17 +695,15 @@ ValueObject *copyValueObject(ValueObject *value)
  * \post The memory at \a value and any of its members will be freed (although
  * see note for full details).
  */
-void deleteValueObject(ValueObject *value)
+void freeValueObjectSlow(ValueObject *value)
 {
-	if (!value) return;
-	P(value);
-	if (!value->semaphore) {
+	{
 		if (value->type == VT_STRING)
 			free(value->data.s);
 		/* FuncDefStmtNode structures get freed with the parse tree */
 		else if (value->type == VT_ARRAY)
 			deleteScopeObject(value->data.a);
-		free(value);
+		recycleValueObject(value);
 	}
 }
 
@@ -381,6 +734,9 @@ ScopeObject *createScopeObject(ScopeObject *parent)
 	p->numvals = 0;
 	p->names = NULL;
 	p->values = NULL;
+	p->cap = 0;
+	p->idxcap = 0;
+	p->index = NULL;
 	p->parent = parent;
 	if (parent) p->caller = parent->caller;
 	else p->caller = NULL;
@@ -418,12 +774,12 @@ void deleteScopeObject(ScopeObject *scope)
 {
 	unsigned int n;
 	if (!scope) return;
-	for (n = 0; n < scope->numvals; n++) {
-		free(scope->names[n]);
+	/* Names are interned and outlive every scope that mentions them. */
+	for (n = 0; n < scope->numvals; n++)
 		deleteValueObject(scope->values[n]);
-	}
 	free(scope->names);
 	free(scope->values);
+	free(scope->index);
 	deleteValueObject(scope->impvar);
 	free(scope);
 }
@@ -447,79 +803,22 @@ ValueObject *createScopeValue(ScopeObject *src,
 {
 	ScopeObject *parent = dest;
 	IdentifierNode *child = target;
-	int status;
-	unsigned int newnumvals;
-	void *mem1 = NULL;
-	void *mem2 = NULL;
-	char *name = NULL;
-	unsigned int pos = 0;
+	const Name *name = NULL;
+	int slot;
 
 	/* Traverse the target to the terminal child and parent */
-	status = resolveTerminalSlot(src, dest, target, &parent, &child);
-	if (!status) goto createScopeValueAbort;
-
-	/* Store the new number of values */
-	newnumvals = dest->numvals + 1;
+	if (!resolveTerminalSlot(src, dest, target, &parent, &child))
+		return NULL;
 
 	/* Look up the identifier name */
-	name = resolveIdentifierName(target, src);
-	if (!name) goto createScopeValueAbort;
+	name = resolveIdentifierIName(target, src);
+	if (!name) return NULL;
 
-	/* realloc if power of two */
-	if (newnumvals && !(newnumvals & (newnumvals - 1))) {
-		int allocnumvals = (newnumvals << 1);
-		/* Add value to local scope */
-		mem1 = realloc(dest->names, sizeof(IdentifierNode *) * allocnumvals);
-		if (!mem1) {
-			perror("realloc");
-			goto createScopeValueAbort;
-		}
-		mem2 = realloc(dest->values, sizeof(ValueObject *) * allocnumvals);
-		if (!mem2) {
-			perror("realloc");
-			goto createScopeValueAbort;
-		}
-	} else {
-		mem1 = dest->names;
-		mem2 = dest->values;
-	}
+	/* Add value to local scope */
+	slot = appendScopeSlot(dest, name);
+	if (slot < 0) return NULL;
 
-	dest->names = mem1;
-	dest->values = mem2;
-
-	/* Insert in lexical order */
-	{
-		int n;
-
-		if (dest->numvals > 0) {
-			/* Find insertion position */
-			pos = binarySearchIndex((const char **)dest->names, 0, dest->numvals - 1, (const char *)name);
-
-			/* Shift values down */
-			for (n = dest->numvals; n > pos; n--) {
-				dest->names[n] = dest->names[n - 1];
-				dest->values[n] = dest->values[n - 1];
-			}
-		}
-
-		/* Insert the value */
-		dest->names[pos] = name;
-		dest->values[pos] = createNilValueObject();
-		if (!dest->values[pos]) goto createScopeValueAbort;
-	}
-
-	dest->numvals = newnumvals;
-
-	return dest->values[pos];
-
-createScopeValueAbort: /* In case something goes wrong... */
-
-	/* Clean up any allocated structures */
-	if (name) free(name);
-	if (mem1) free(mem1);
-	if (mem2) free(mem2);
-
-	return NULL;
+	return dest->values[slot];
 }
 
 /**
@@ -545,50 +844,34 @@ ValueObject *updateScopeValue(ScopeObject *src,
 {
 	ScopeObject *parent = dest;
 	IdentifierNode *child = target;
-	int status;
-	char *name = NULL;
+	const Name *name = NULL;
 
 	/* Traverse the target to the terminal child and parent */
-	status = resolveTerminalSlot(src, dest, target, &parent, &child);
-	if (!status) goto updateScopeValueAbort;
+	if (!resolveTerminalSlot(src, dest, target, &parent, &child))
+		return NULL;
 
 	/* Look up the identifier name */
-	name = resolveIdentifierName(child, src);
-	if (!name) goto updateScopeValueAbort;
+	name = resolveIdentifierIName(child, src);
+	if (!name) return NULL;
 
 	/* Traverse upwards through scopes */
 	do {
-		if (parent->numvals == 0) continue;
-
-		unsigned int n = binarySearchIndex((const char **)parent->names, 0, parent->numvals - 1, (const char *)name);
-
-		if (n >= parent->numvals) continue;
-
-		if (!strcmp(parent->names[n], name)) {
-			free(name);
-			/* Delete the old value */
-			deleteValueObject(parent->values[n]);
+		int slot = findScopeSlot(parent, name);
+		if (slot >= 0) {
+			/* Wipe out the old value */
+			deleteValueObject(parent->values[slot]);
 			/* Assign the new value */
-			if (value) {
-				parent->values[n] = value;
-			}
-			else {
-				parent->values[n] = createNilValueObject();
-			}
-			return parent->values[n];
+			if (value) parent->values[slot] = value;
+			else parent->values[slot] = createNilValueObject();
+			return parent->values[slot];
 		}
 	} while ((parent = parent->parent));
 
 	{
-		char *name = resolveIdentifierName(target, src);
-		error(IN_UNABLE_TO_STORE_VARIABLE, target->fname, target->line, name);
-		free(name);
+		char *n = resolveIdentifierName(target, src);
+		error(IN_UNABLE_TO_STORE_VARIABLE, target->fname, target->line, n);
+		if (n) free(n);
 	}
-
-updateScopeValueAbort: /* In case something goes wrong... */
-
-	/* Clean up any allocated structures */
-	if (name) free(name);
 
 	return NULL;
 }
@@ -613,39 +896,27 @@ ValueObject *getScopeValue(ScopeObject *src,
 {
 	ScopeObject *parent = dest;
 	IdentifierNode *child = target;
-	char *name = NULL;
-	int status;
+	const Name *name = NULL;
 
 	/* Traverse the target to the terminal child and parent */
-	status = resolveTerminalSlot(src, dest, target, &parent, &child);
-	if (!status) goto getScopeValueAbort;
+	if (!resolveTerminalSlot(src, dest, target, &parent, &child))
+		return NULL;
 
 	/* Look up the identifier name */
-	name = resolveIdentifierName(child, src);
-	if (!name) goto getScopeValueAbort;
+	name = resolveIdentifierIName(child, src);
+	if (!name) return NULL;
 
 	/* Traverse upwards through scopes */
 	do {
-		unsigned int n;
-		/* Check for value in current scope */
-		for (n = 0; n < parent->numvals; n++) {
-			if (!strcmp(parent->names[n], name)) {
-				free(name);
-				return parent->values[n];
-			}
-		}
+		int slot = findScopeSlot(parent, name);
+		if (slot >= 0) return parent->values[slot];
 	} while ((parent = parent->parent));
 
 	{
-		char *name = resolveIdentifierName(child, src);
-		error(IN_VARIABLE_DOES_NOT_EXIST, child->fname, child->line, name);
-		free(name);
+		char *n = resolveIdentifierName(child, src);
+		error(IN_VARIABLE_DOES_NOT_EXIST, child->fname, child->line, n);
+		if (n) free(n);
 	}
-
-getScopeValueAbort: /* In case something goes wrong... */
-
-	/* Clean up any allocated structures */
-	if (name) free(name);
 
 	return NULL;
 }
@@ -671,48 +942,34 @@ ScopeObject *getScopeObjectLocal(ScopeObject *src,
                                  IdentifierNode *target)
 {
 	ScopeObject *current = dest;
-	char *name = NULL;
+	const Name *name = NULL;
 
 	/* Look up the identifier name */
-	name = resolveIdentifierName(target, src);
-	if (!name) goto getScopeObjectLocalAbort;
+	name = resolveIdentifierIName(target, src);
+	if (!name) return NULL;
 
 	/* Check for calling object reference variable */
-	if (!strcmp(name, "ME")) {
+	if (name == getNameME()) {
 		/* Traverse upwards through callers */
 		for (current = dest;
 				current->caller;
 				current = current->caller);
-		free(name);
 		return current;
 	}
 
 	/* Traverse upwards through scopes */
 	do {
-		unsigned int n;
-		/* Check for value in current scope */
-		for (n = 0; n < current->numvals; n++) {
-			if (!strcmp(current->names[n], name)) {
-				if (current->values[n]->type != VT_ARRAY) {
-					error(IN_VARIABLE_NOT_AN_ARRAY, target->fname, target->line, name);
-					goto getScopeObjectLocalAbort;
-				}
-				free(name);
-				return getArray(current->values[n]);
+		int slot = findScopeSlot(current, name);
+		if (slot >= 0) {
+			if (current->values[slot]->type != VT_ARRAY) {
+				error(IN_VARIABLE_NOT_AN_ARRAY, target->fname, target->line, name->str);
+				return NULL;
 			}
+			return getArray(current->values[slot]);
 		}
 	} while ((current = current->parent));
 
-	{
-		char *name = resolveIdentifierName(target, src);
-		error(IN_VARIABLE_DOES_NOT_EXIST, target->fname, target->line, name);
-		free(name);
-	}
-
-getScopeObjectLocalAbort: /* In case something goes wrong... */
-
-	/* Clean up any allocated structures */
-	if (name) free(name);
+	error(IN_VARIABLE_DOES_NOT_EXIST, target->fname, target->line, name->str);
 
 	return NULL;
 }
@@ -738,59 +995,55 @@ ScopeObject *getScopeObjectLocalCaller(ScopeObject *src,
                                  IdentifierNode *target)
 {
 	ScopeObject *current = dest;
-	char *name = NULL;
+	const Name *name = NULL;
 
 	/* Look up the identifier name */
-	name = resolveIdentifierName(target, src);
-	if (!name) goto getScopeObjectLocalCallerAbort;
+	name = resolveIdentifierIName(target, src);
+	if (!name) return NULL;
 
 	/* Check for calling object reference variable */
-	if (!strcmp(name, "ME")) {
+	if (name == getNameME()) {
 		/* Traverse upwards through callers */
 		for (current = dest;
 				current->caller;
 				current = current->caller);
-		free(name);
 		return current;
 	}
 
 	/* Traverse upwards through scopes */
 	do {
-		unsigned int n;
-		/* Check for value in current scope */
-		for (n = 0; n < current->numvals; n++) {
-			if (!strcmp(current->names[n], name)) {
-				if (current->values[n]->type != VT_ARRAY
-						&& current->values[n]->type != VT_FUNC) {
-					error(IN_VARIABLE_NOT_AN_ARRAY, target->fname, target->line, name);
-					goto getScopeObjectLocalCallerAbort;
-				}
-				free(name);
-				if (current->values[n]->type == VT_ARRAY)
-				{
-					return getArray(current->values[n]);
-				}
-				else
-				{
-					return dest;
-				}
+		int slot = findScopeSlot(current, name);
+		if (slot >= 0) {
+			ValueObject *val = current->values[slot];
+			if (val->type != VT_ARRAY && val->type != VT_FUNC) {
+				error(IN_VARIABLE_NOT_AN_ARRAY, target->fname, target->line, name->str);
+				return NULL;
 			}
+			if (val->type == VT_ARRAY) return getArray(val);
+			else return dest;
 		}
 	} while ((current = current->parent));
 
-	{
-		char *name = resolveIdentifierName(target, src);
-		error(IN_VARIABLE_DOES_NOT_EXIST, target->fname, target->line, name);
-		free(name);
-	}
-
-getScopeObjectLocalCallerAbort: /* In case something goes wrong... */
-
-	/* Clean up any allocated structures */
-	if (name) free(name);
+	error(IN_VARIABLE_DOES_NOT_EXIST, target->fname, target->line, name->str);
 
 	return NULL;
 }
+
+/**
+ * Gets a scope (possibly by casting a function) without accessing any arrays.
+ *
+ * \param [in] src The scope to evaluate \a target under.
+ *
+ * \param [in,out] dest The scope to update the value in.
+ *
+ * \param [in] target The name of the value containing the scope to get.
+ *
+ * \return The scope contained in the value in \a dest, named by evaluating \a
+ * target under \a src, without accessing any arrays.
+ *
+ * \retval NULL Either \a target could not be evaluated in \a src or \a target
+ * could not be found in \a dest.
+ */
 
 /**
  * Gets a value from a scope without accessing its ancestors.
@@ -811,9 +1064,9 @@ ValueObject *getScopeValueLocal(ScopeObject *src,
                                 ScopeObject *dest,
                                 IdentifierNode *target)
 {
-	unsigned int n;
-	char *name = NULL;
+	const Name *name = NULL;
 	ScopeObject *scope = NULL;
+	int slot;
 
 	/* Access any slots */
 	while (target->slot) {
@@ -822,40 +1075,19 @@ ValueObject *getScopeValueLocal(ScopeObject *src,
 		 * for resolving variables in indirect identifiers
 		 */
 		scope = getScopeObjectLocal(src, dest, target);
-		if (!scope) return 0;
+		if (!scope) return NULL;
 		dest = scope;
 
 		target = target->slot;
 	}
 
 	/* Look up the identifier name */
-	name = resolveIdentifierName(target, src);
-	if (!name) goto getScopeValueLocalAbort;
+	name = resolveIdentifierIName(target, src);
+	if (!name) return NULL;
 
 	/* Check for value in current scope */
-	if (dest->numvals > 0) {
-		n = binarySearchIndex((const char **)dest->names, 0, dest->numvals - 1, (const char *)name);
-
-		if (n < dest->numvals) {
-			if (!strcmp(dest->names[n], name)) {
-				free(name);
-				return dest->values[n];
-			}
-		}
-	}
-	/*
-	for (n = 0; n < dest->numvals; n++) {
-		if (!strcmp(dest->names[n], name)) {
-			free(name);
-			return dest->values[n];
-		}
-	}
-	*/
-
-getScopeValueLocalAbort: /* In case something goes wrong... */
-
-	/* Clean up any allocated structures */
-	if (name) free(name);
+	slot = findScopeSlot(dest, name);
+	if (slot >= 0) return dest->values[slot];
 
 	return NULL;
 }
@@ -953,10 +1185,8 @@ void deleteScopeValue(ScopeObject *src,
                       IdentifierNode *target)
 {
 	ScopeObject *current = NULL;
-	char *name = NULL;
-	void *mem1 = NULL;
-	void *mem2 = NULL;
 	ScopeObject *scope = NULL;
+	const Name *name = NULL;
 
 	/* Access any slots */
 	while (target->slot) {
@@ -965,64 +1195,35 @@ void deleteScopeValue(ScopeObject *src,
 		 * for resolving variables in indirect identifiers
 		 */
 		scope = getScopeObjectLocal(src, dest, target);
-		if (!scope) goto deleteScopeValueAbort;
+		if (!scope) return;
 		dest = scope;
 		target = target->slot;
 	}
 	current = dest;
 
 	/* Look up the identifier name */
-	name = resolveIdentifierName(target, src);
-	if (!name) goto deleteScopeValueAbort;
+	name = resolveIdentifierIName(target, src);
+	if (!name) return;
 
 	/* Traverse upwards through scopes */
 	do {
-		if (current->numvals == 0) continue;
-
-		unsigned int n = binarySearchIndex((const char **)current->names, 0, current->numvals - 1, (const char *)name);
-
-		if (n >= current->numvals) continue;
-
-		if (!strcmp(current->names[n], name)) {
+		int slot = findScopeSlot(current, name);
+		if (slot >= 0) {
 			unsigned int i;
-			unsigned int newnumvals = current->numvals - 1;
-			free(name);
-			/* Wipe out the name and value */
-			free(current->names[n]);
-			deleteValueObject(current->values[n]);
-			/* Reorder the tables */
-			for (i = n; i < current->numvals - 1; i++) {
+			scopeVersion++;
+			/* Wipe out the value */
+			deleteValueObject(current->values[slot]);
+			/* Close the hole left in the tables */
+			for (i = (unsigned int)slot; i + 1 < current->numvals; i++) {
 				current->names[i] = current->names[i + 1];
 				current->values[i] = current->values[i + 1];
 			}
-			/* Resize the tables */
-			mem1 = realloc(current->names, sizeof(IdentifierNode *) * newnumvals);
-			if (!mem1) {
-				perror("realloc");
-				goto deleteScopeValueAbort;
-			}
-			mem2 = realloc(current->values, sizeof(ValueObject *) * newnumvals);
-			if (!mem2) {
-				perror("realloc");
-				goto deleteScopeValueAbort;
-			}
-			current->names = mem1;
-			current->values = mem2;
-			current->numvals = newnumvals;
+			current->numvals--;
+			/* Every index entry past the hole now points one slot high */
+			if (current->idxcap) reindexScope(current);
 			return;
 		}
 	} while ((current = current->parent));
-
-	free(name);
-
-	return;
-
-deleteScopeValueAbort: /* In case something goes wrong... */
-
-	/* Clean up any allocated structures */
-	if (name) free(name);
-
-	return;
 }
 
 /**
@@ -1039,7 +1240,7 @@ deleteScopeValueAbort: /* In case something goes wrong... */
 ReturnObject *createReturnObject(ReturnType type,
                                  ValueObject *value)
 {
-	ReturnObject *p = malloc(sizeof(ReturnObject));
+	ReturnObject *p = allocReturnObject();
 	if (!p) {
 		perror("malloc");
 		return NULL;
@@ -1061,7 +1262,7 @@ void deleteReturnObject(ReturnObject *object)
 	if (!object) return;
 	if (object->type == RT_RETURN)
 		deleteValueObject(object->value);
-	free(object);
+	recycleReturnObject(object);
 }
 
 /**
@@ -1489,6 +1690,7 @@ ValueObject *castStringExplicit(ValueObject *node,
 					size_t len;
 					char *image = NULL;
 					long codepoint;
+					/* A code point above U+FFFF needs four bytes. */
 					char out[4];
 					size_t num;
 					void *mem = NULL;
@@ -1536,6 +1738,7 @@ ValueObject *castStringExplicit(ValueObject *node,
 					size_t len;
 					char *image = NULL;
 					long codepoint;
+					/* A code point above U+FFFF needs four bytes. */
 					char out[4];
 					size_t num;
 					void *mem = NULL;
@@ -1732,6 +1935,79 @@ ValueObject *interpretCastExprNode(ExprNode *node,
  *
  * \retval NULL An error occurred during interpretation.
  */
+/**
+ * Calls a function with values that have already been evaluated.
+ *
+ * This is the path the virtual machine takes into a function the compiler
+ * could not lower, and the path \ref interpretFuncCallExprNode takes once it
+ * has evaluated the call's arguments.
+ *
+ * \param [in] def The function to call.
+ *
+ * \param [in] args The argument values, which are borrowed.
+ *
+ * \param [in] numargs The number of arguments.
+ *
+ * \param [in] scope The scope the call is made from.
+ *
+ * \return The function's return value.
+ *
+ * \retval NULL The call failed and an error has been reported.
+ */
+ValueObject *callFunctionValues(FuncDefStmtNode *def,
+                                ValueObject **args,
+                                unsigned int numargs,
+                                ScopeObject *scope)
+{
+	ScopeObject *outer = NULL;
+	ReturnObject *retval = NULL;
+	ValueObject *ret = NULL;
+	unsigned int n;
+
+	if (stackExhausted()) {
+		error(IN_RECURSION_TOO_DEEP);
+		return NULL;
+	}
+
+	outer = createScopeObjectCaller(scope, scope);
+	if (!outer) return NULL;
+
+	for (n = 0; n < numargs; n++) {
+		if (!createScopeValue(scope, outer, def->args->ids[n])
+				|| !updateScopeValue(scope, outer, def->args->ids[n],
+						copyValueObject(args[n]))) {
+			deleteScopeObject(outer);
+			return NULL;
+		}
+	}
+
+	if (!(retval = interpretStmtNodeList(def->body->stmts, outer))) {
+		deleteScopeObject(outer);
+		return NULL;
+	}
+	switch (retval->type) {
+		case RT_DEFAULT:
+			/* Extract return value */
+			ret = outer->impvar;
+			outer->impvar = NULL;
+			break;
+		case RT_BREAK:
+			ret = createNilValueObject();
+			break;
+		case RT_RETURN:
+			/* Extract return value */
+			ret = retval->value;
+			retval->value = NULL;
+			break;
+		default:
+			error(IN_INVALID_RETURN_TYPE);
+			break;
+	}
+	deleteReturnObject(retval);
+	deleteScopeObject(outer);
+	return ret;
+}
+
 ValueObject *interpretFuncCallExprNode(ExprNode *node,
                                        ScopeObject *scope)
 {
@@ -1744,13 +2020,15 @@ ValueObject *interpretFuncCallExprNode(ExprNode *node,
 	ScopeObject *dest = NULL;
 	ScopeObject *target = NULL;
 
+	if (stackExhausted()) {
+		error(IN_RECURSION_TOO_DEEP);
+		return NULL;
+	}
+
 	dest = getScopeObject(scope, scope, expr->scope);
 
 	target = getScopeObjectLocalCaller(scope, dest, expr->name);
 	if (!target) return NULL;
-
-	outer = createScopeObjectCaller(scope, target);
-	if (!outer) return NULL;
 
 	def = getScopeValue(scope, dest, expr->name);
 
@@ -1761,7 +2039,6 @@ ValueObject *interpretFuncCallExprNode(ExprNode *node,
 			error(IN_UNDEFINED_FUNCTION, id->fname, id->line, name);
 			free(name);
 		}
-		deleteScopeObject(outer);
 		return NULL;
 	}
 	/* Check for correct supplied arity */
@@ -1772,9 +2049,39 @@ ValueObject *interpretFuncCallExprNode(ExprNode *node,
 			error(IN_INCORRECT_NUMBER_OF_ARGUMENTS, id->fname, id->line, name);
 			free(name);
 		}
-		deleteScopeObject(outer);
 		return NULL;
 	}
+
+	/* A compiled function is entered directly, with its arguments in a
+	 * plain array rather than a scope. */
+	if (getFunction(def)->proto) {
+		ValueObject **vals = NULL;
+		if (expr->args->num) {
+			vals = malloc(sizeof(ValueObject *) * expr->args->num);
+			if (!vals) {
+				perror("malloc");
+				return NULL;
+			}
+		}
+		for (n = 0; n < expr->args->num; n++) {
+			vals[n] = interpretExprNode(expr->args->exprs[n], scope);
+			if (!vals[n]) {
+				unsigned int i;
+				for (i = 0; i < n; i++) deleteValueObject(vals[i]);
+				free(vals);
+				return NULL;
+			}
+		}
+		ret = callProto((Proto *)getFunction(def)->proto, vals,
+				expr->args->num, scope, target);
+		for (n = 0; n < expr->args->num; n++) deleteValueObject(vals[n]);
+		free(vals);
+		return ret;
+	}
+
+	outer = createScopeObjectCaller(scope, target);
+	if (!outer) return NULL;
+
 	for (n = 0; n < getFunction(def)->args->num; n++) {
 		ValueObject *val = NULL;
 		if (!createScopeValue(scope, outer, getFunction(def)->args->ids[n])) {
@@ -2499,31 +2806,23 @@ static ValueObject *(*ArithOpJumpTable[7][2][2])(ValueObject *, ValueObject *) =
  *
  * \retval NULL An error occurred during interpretation.
  */
-ValueObject *interpretArithOpExprNode(OpExprNode *expr,
-                                      ScopeObject *scope)
+ValueObject *applyArithOp(OpType type,
+                          ValueObject *val1,
+                          ValueObject *val2,
+                          ScopeObject *scope)
 {
-	ValueObject *val1 = interpretExprNode(expr->args->exprs[0], scope);
-	ValueObject *val2 = interpretExprNode(expr->args->exprs[1], scope);
 	ValueObject *use1 = val1;
 	ValueObject *use2 = val2;
 	unsigned int cast1 = 0;
 	unsigned int cast2 = 0;
 	ValueObject *ret = NULL;
-	if (!val1 || !val2) {
-		deleteValueObject(val1);
-		deleteValueObject(val2);
-		return NULL;
-	}
+
 	/* Check if a floating point decimal string and cast */
 	switch (val1->type) {
 		case VT_NIL:
 		case VT_BOOLEAN:
 			use1 = castIntegerImplicit(val1, scope);
-			if (!use1) {
-				deleteValueObject(val1);
-				deleteValueObject(val2);
-				return NULL;
-			}
+			if (!use1) return NULL;
 			cast1 = 1;
 			break;
 		case VT_INTEGER:
@@ -2532,34 +2831,25 @@ ValueObject *interpretArithOpExprNode(OpExprNode *expr,
 		case VT_STRING: {
 			/* Perform interpolation */
 			ValueObject *interp = castStringExplicit(val1, scope);
-			if (!interp) {
-				deleteValueObject(val1);
-				deleteValueObject(val2);
-				return NULL;
-			}
+			if (!interp) return NULL;
 			if (strchr(getString(interp), '.'))
 				use1 = castFloatImplicit(interp, scope);
 			else
 				use1 = castIntegerImplicit(interp, scope);
 			deleteValueObject(interp);
-			if (!use1) {
-				deleteValueObject(val1);
-				deleteValueObject(val2);
-				return NULL;
-			}
+			if (!use1) return NULL;
 			cast1 = 1;
 			break;
 		}
 		default:
 			error(IN_INVALID_OPERAND_TYPE);
+			return NULL;
 	}
 	switch (val2->type) {
 		case VT_NIL:
 		case VT_BOOLEAN:
 			use2 = castIntegerImplicit(val2, scope);
 			if (!use2) {
-				deleteValueObject(val1);
-				deleteValueObject(val2);
 				if (cast1) deleteValueObject(use1);
 				return NULL;
 			}
@@ -2572,8 +2862,6 @@ ValueObject *interpretArithOpExprNode(OpExprNode *expr,
 			/* Perform interpolation */
 			ValueObject *interp = castStringExplicit(val2, scope);
 			if (!interp) {
-				deleteValueObject(val1);
-				deleteValueObject(val2);
 				if (cast1) deleteValueObject(use1);
 				return NULL;
 			}
@@ -2583,8 +2871,6 @@ ValueObject *interpretArithOpExprNode(OpExprNode *expr,
 				use2 = castIntegerImplicit(interp, scope);
 			deleteValueObject(interp);
 			if (!use2) {
-				deleteValueObject(val1);
-				deleteValueObject(val2);
 				if (cast1) deleteValueObject(use1);
 				return NULL;
 			}
@@ -2593,15 +2879,61 @@ ValueObject *interpretArithOpExprNode(OpExprNode *expr,
 		}
 		default:
 			error(IN_INVALID_OPERAND_TYPE);
+			if (cast1) deleteValueObject(use1);
+			return NULL;
 	}
 	/* Do math depending on value types */
-	ret = ArithOpJumpTable[expr->type][use1->type][use2->type](use1, use2);
+	ret = ArithOpJumpTable[type][use1->type][use2->type](use1, use2);
 	/* Clean up after floating point decimal casts */
 	if (cast1) deleteValueObject(use1);
 	if (cast2) deleteValueObject(use2);
+	return ret;
+}
+
+ValueObject *interpretArithOpExprNode(OpExprNode *expr,
+                                      ScopeObject *scope)
+{
+	ValueObject *val1 = interpretExprNode(expr->args->exprs[0], scope);
+	ValueObject *val2 = interpretExprNode(expr->args->exprs[1], scope);
+	ValueObject *ret = NULL;
+	if (!val1 || !val2) {
+		deleteValueObject(val1);
+		deleteValueObject(val2);
+		return NULL;
+	}
+	ret = applyArithOp(expr->type, val1, val2, scope);
 	deleteValueObject(val1);
 	deleteValueObject(val2);
 	return ret;
+}
+
+/**
+ * Reduces a value to the truth of its contents.
+ *
+ * \param [in] val The value to test.
+ *
+ * \param [in] scope The scope to cast \a val under.
+ *
+ * \param [out] ok Set to zero if \a val could not be cast.
+ *
+ * \return Whether \a val is true.
+ */
+int valueIsTrue(ValueObject *val, ScopeObject *scope, int *ok)
+{
+	ValueObject *use = val;
+	int ret;
+	*ok = 1;
+	if (val->type != VT_BOOLEAN && val->type != VT_INTEGER) {
+		use = castBooleanImplicit(val, scope);
+		if (!use) {
+			*ok = 0;
+			return 0;
+		}
+		ret = (getInteger(use) != 0);
+		deleteValueObject(use);
+		return ret;
+	}
+	return getInteger(use) != 0;
 }
 
 /**
@@ -2918,6 +3250,52 @@ static ValueObject *(*BoolOpJumpTable[2][5][5])(ValueObject *, ValueObject *) = 
  *
  * \retval NULL An error occurred during interpretation.
  */
+ValueObject *applyEqualityOp(OpType type,
+                             ValueObject *val1,
+                             ValueObject *val2,
+                             ScopeObject *scope)
+{
+	ValueObject *use1 = val1;
+	ValueObject *use2 = val2;
+	ValueObject *ret = NULL;
+
+	/*
+	 * Since there is no automatic casting, an equality (inequality) test
+	 * against a non-number type will always fail (succeed).
+	 */
+	if ((val1->type != val2->type)
+			&& ((val1->type != VT_INTEGER && val1->type != VT_FLOAT)
+			|| (val2->type != VT_INTEGER && val2->type != VT_FLOAT))) {
+		switch (type) {
+			case OP_EQ:
+				return createBooleanValueObject(0);
+			case OP_NEQ:
+				return createBooleanValueObject(1);
+			default:
+				error(IN_INVALID_EQUALITY_OPERATION_TYPE);
+				return NULL;
+		}
+	}
+
+	/* If comparing strings, interpolate them first.  The types are equal
+	 * here, so testing one of them is enough. */
+	if (val1->type == VT_STRING) {
+		use1 = castStringExplicit(val1, scope);
+		use2 = castStringExplicit(val2, scope);
+		if (!use1 || !use2) {
+			if (use1) deleteValueObject(use1);
+			if (use2) deleteValueObject(use2);
+			return NULL;
+		}
+	}
+
+	ret = BoolOpJumpTable[type - OP_EQ][use1->type][use2->type](use1, use2);
+
+	if (use1 != val1) deleteValueObject(use1);
+	if (use2 != val2) deleteValueObject(use2);
+	return ret;
+}
+
 ValueObject *interpretEqualityOpExprNode(OpExprNode *expr,
                                          ScopeObject *scope)
 {
@@ -2929,39 +3307,7 @@ ValueObject *interpretEqualityOpExprNode(OpExprNode *expr,
 		deleteValueObject(val2);
 		return NULL;
 	}
-	/*
-	 * Since there is no automatic casting, an equality (inequality) test
-	 * against a non-number type will always fail (succeed).
-	 */
-	if ((val1->type != val2->type)
-			&& ((val1->type != VT_INTEGER && val1->type != VT_FLOAT)
-			|| (val2->type != VT_INTEGER && val2->type != VT_FLOAT))) {
-		switch (expr->type) {
-			case OP_EQ:
-				ret = createBooleanValueObject(0);
-				break;
-			case OP_NEQ:
-				ret = createBooleanValueObject(1);
-				break;
-			default:
-				error(IN_INVALID_EQUALITY_OPERATION_TYPE);
-				deleteValueObject(val1);
-				deleteValueObject(val2);
-				return NULL;
-		}
-	}
-	else {
-		/* If comparing strings, interpolate them first */
-		ValueObject *old1 = val1;
-		ValueObject *old2 = val2;
-		if (val1->type == VT_STRING) {
-			val1 = castStringExplicit(val1, scope);
-			val2 = castStringExplicit(val2, scope);
-			deleteValueObject(old1);
-			deleteValueObject(old2);
-		}
-		ret = BoolOpJumpTable[expr->type - OP_EQ][val1->type][val2->type](val1, val2);
-	}
+	ret = applyEqualityOp(expr->type, val1, val2, scope);
 	deleteValueObject(val1);
 	deleteValueObject(val2);
 	return ret;
@@ -2978,6 +3324,57 @@ ValueObject *interpretEqualityOpExprNode(OpExprNode *expr,
  *
  * \retval NULL An error occurred during interpretation.
  */
+/**
+ * Joins values end to end as a string.
+ *
+ * \param [in] vals The values to join.
+ *
+ * \param [in] num The number of values.
+ *
+ * \param [in] scope The scope to cast the values under.
+ *
+ * \return A string value holding the values one after another.
+ *
+ * \retval NULL A value could not be cast to a string.
+ */
+ValueObject *concatValues(ValueObject **vals,
+                          unsigned int num,
+                          ScopeObject *scope)
+{
+	unsigned int n;
+	size_t len = 0;
+	char *acc = malloc(1);
+
+	if (!acc) {
+		perror("malloc");
+		return NULL;
+	}
+	acc[0] = '\0';
+
+	for (n = 0; n < num; n++) {
+		ValueObject *use = castStringImplicit(vals[n], scope);
+		size_t add;
+		void *mem;
+		if (!use) {
+			free(acc);
+			return NULL;
+		}
+		add = strlen(getString(use));
+		mem = realloc(acc, len + add + 1);
+		if (!mem) {
+			perror("realloc");
+			deleteValueObject(use);
+			free(acc);
+			return NULL;
+		}
+		acc = mem;
+		memcpy(acc + len, getString(use), add + 1);
+		len += add;
+		deleteValueObject(use);
+	}
+	return createStringValueObject(acc);
+}
+
 ValueObject *interpretConcatOpExprNode(OpExprNode *expr,
                                        ScopeObject *scope)
 {
@@ -3211,22 +3608,30 @@ ReturnObject *interpretPrintStmtNode(StmtNode *node,
  *
  * \retval NULL An error occurred during interpretation.
  */
-ReturnObject *interpretInputStmtNode(StmtNode *node,
-                                     ScopeObject *scope)
+/**
+ * Reads one line from standard input.
+ *
+ * \note The specification is unclear as to the exact semantics of input.
+ * Here, we read up until the first newline or EOF but do not store it.
+ *
+ * \return The line read, as a string value.
+ *
+ * \retval NULL Memory allocation failed.
+ */
+ValueObject *readLineValue(void)
 {
 	unsigned int size = 16;
 	unsigned int cur = 0;
 	char *temp = malloc(sizeof(char) * size);
 	int c;
 	void *mem = NULL;
-	InputStmtNode *stmt = (InputStmtNode *)node->stmt;
 	ValueObject *val = NULL;
+
+	if (!temp) {
+		perror("malloc");
+		return NULL;
+	}
 	while ((c = getchar()) && !feof(stdin)) {
-		/**
-		 * \note The specification is unclear as to the exact semantics
-		 * of input.  Here, we read up until the first newline or EOF
-		 * but do not store it.
-		 */
 		if (c == EOF || c == (int)'\r' || c == (int)'\n') break;
 		temp[cur] = (char)c;
 		cur++;
@@ -3256,6 +3661,15 @@ ReturnObject *interpretInputStmtNode(StmtNode *node,
 		free(temp);
 		return NULL;
 	}
+	return val;
+}
+
+ReturnObject *interpretInputStmtNode(StmtNode *node,
+                                     ScopeObject *scope)
+{
+	InputStmtNode *stmt = (InputStmtNode *)node->stmt;
+	ValueObject *val = readLineValue();
+	if (!val) return NULL;
 	if (!updateScopeValue(scope, scope, stmt->target, val)) {
 		deleteValueObject(val);
 		return NULL;
@@ -3464,6 +3878,42 @@ ReturnObject *interpretIfThenElseStmtNode(StmtNode *node,
  *
  * \retval NULL An error occurred during interpretation.
  */
+/**
+ * Compares a value against a switch guard.
+ *
+ * A switch does not cast: a guard only matches a value of its own type, and
+ * nil never matches anything.
+ *
+ * \param [in] use1 The value being switched on.
+ *
+ * \param [in] use2 The guard to compare it against.
+ *
+ * \retval 1 They match.
+ * \retval 0 They do not match.
+ * \retval -1 The value has a type a switch cannot compare.
+ */
+int switchMatches(ValueObject *use1, ValueObject *use2)
+{
+	if (use1->type != use2->type) return 0;
+	switch (use1->type) {
+		case VT_NIL:
+			return 0;
+		case VT_BOOLEAN:
+		case VT_INTEGER:
+			return getInteger(use1) == getInteger(use2);
+		case VT_FLOAT:
+			return fabs(getFloat(use1) - getFloat(use2)) < FLT_EPSILON;
+		case VT_STRING:
+			/**
+			 * \note Strings with interpolation should have already
+			 * been checked for.
+			 */
+			return !strcmp(getString(use1), getString(use2));
+		default:
+			return -1;
+	}
+}
+
 ReturnObject *interpretSwitchStmtNode(StmtNode *node,
                                       ScopeObject *scope)
 {
@@ -3478,32 +3928,14 @@ ReturnObject *interpretSwitchStmtNode(StmtNode *node,
 		ValueObject *use2 = interpretExprNode(stmt->guards->exprs[n], scope);
 		unsigned int done = 0;
 		if (!use2) return NULL;
-		if (use1->type == use2->type) {
-			switch (use1->type) {
-				case VT_NIL:
-					break;
-				case VT_BOOLEAN:
-				case VT_INTEGER:
-					if (getInteger(use1) == getInteger(use2))
-						done = 1;
-					break;
-				case VT_FLOAT:
-					if (fabs(getFloat(use1) - getFloat(use2)) < FLT_EPSILON)
-						done = 1;
-					break;
-				case VT_STRING:
-					/**
-					 * \note Strings with interpolation
-					 * should have already been checked for.
-					 */
-					if (!strcmp(getString(use1), getString(use2)))
-						done = 1;
-					break;
-				default:
-					error(IN_INVALID_TYPE);
-					deleteValueObject(use2);
-					return NULL;
+		{
+			int m = switchMatches(use1, use2);
+			if (m < 0) {
+				error(IN_INVALID_TYPE);
+				deleteValueObject(use2);
+				return NULL;
 			}
+			done = (unsigned int)m;
 		}
 		deleteValueObject(use2);
 		if (done) break;
@@ -4008,7 +4440,19 @@ ReturnObject *interpretBlockNode(BlockNode *node,
 int interpretMainNodeScope(MainNode *main, ScopeObject *scope)
 {
 	ReturnObject *ret = NULL;
+	Proto *proto;
 	if (!main) return 1;
+
+	compileProgram(main);
+
+	proto = getMainProto();
+	if (proto) {
+		ValueObject *val = callProto(proto, NULL, 0, scope, NULL);
+		if (!val) return 1;
+		deleteValueObject(val);
+		return 0;
+	}
+
 	ret = interpretBlockNode(main->block, scope);
 	if (!ret) return 1;
 	deleteReturnObject(ret);

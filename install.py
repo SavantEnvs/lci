@@ -4,7 +4,7 @@ import argparse
 import sys
 import os
 
-#Checks if a string is a positive integer
+# Checks if a string is a positive integer
 def positiveInt(string):
   value = int(string)
   if not value >= 1:
@@ -34,7 +34,7 @@ def runSubProc(command, description, errorMsg, output):
     print("Error installing: " + errorMsg)
     sys.exit(1)
 
-#Remove the CMakeCache.txt so we can garuntee a fresh configure
+# Remove the CMakeCache.txt so we can garuntee a fresh configure
 if os.path.exists("CMakeCache.txt"):
   os.remove("CMakeCache.txt")
 

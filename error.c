@@ -64,6 +64,8 @@ static const char *err_msgs[] = {
 	"%s:%u: expected matching loop name at: %s\n",
 	/* PR_EXPECTED_STATEMENT */
 	"%s:%u: expected statement at: %s\n",
+	/* PR_UNHANDLED_STRING */
+	"unhandled string detected\n",
 
 	/* IN_INVALID_IDENTIFIER_TYPE */
 	"%s:%u invalid identifier type at: %s\n",
@@ -147,6 +149,10 @@ static const char *err_msgs[] = {
 	"%s:%u: cannot cast value to array at: %s\n",
 	/* IN_UNABLE_TO_EXECUTE_COMMAND */
 	"Unable to execute command\n",
+	/* IN_INVALID_OPCODE */
+	"Invalid opcode\n",
+	/* IN_RECURSION_TOO_DEEP */
+	"Recursion too deep\n",
 };
 
 static const int err_codes[] = {
@@ -183,10 +189,11 @@ static const int err_codes[] = {
 	415, /* PR_CANNOT_USE_STR_AS_LITERAL */
 	416, /* PR_LITERAL_MUST_BE_UNIQUE */
 	417, /* PR_EXPECTED_LOOP_NAME */
-	418, /* PR_EXPECTED_ONE_OF */
+	418, /* PR_EXPECTED_EITHER_TOKEN */
 	419, /* PR_EXPECTED_UNARY_FUNCTION */
 	420, /* PR_EXPECTED_MATCHING_LOOP_NAME */
 	421, /* PR_EXPECTED_STATEMENT */
+	422, /* PR_UNHANDLED_STRING */
 
 	/* The 500 block is for the interpreter */
 	500, /* IN_INVALID_IDENTIFIER_TYPE */
@@ -230,6 +237,8 @@ static const int err_codes[] = {
 	538, /* IN_FUNCTION_NAME_USED_BY_VARIABLE */
 	539, /* IN_CANNOT_CAST_VALUE_TO_ARRAY */
 	540, /* IN_UNABLE_TO_EXECUTE_COMMAND */
+	541, /* IN_INVALID_OPCODE */
+	542, /* IN_RECURSION_TOO_DEEP */
 };
 
 int error(ErrorType e, ...)
