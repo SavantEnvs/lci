@@ -156,6 +156,42 @@ static void declareIdentifier(IdentifierNode *id)
 }
 
 /**
+ * Whether the analysis below understands a statement.
+ *
+ * A node type it has never seen could read or write a variable in a way it
+ * cannot account for, so meeting one has to disable register allocation rather
+ * than be passed over.  Adding a statement to the language means adding it here
+ * and to the scans, or programs using it quietly keep their variables in scope
+ * objects.
+ */
+static int knownStmtType(StmtType t)
+{
+	switch (t) {
+		case ST_CAST: case ST_PRINT: case ST_INPUT: case ST_ASSIGNMENT:
+		case ST_DECLARATION: case ST_IFTHENELSE: case ST_SWITCH:
+		case ST_BREAK: case ST_RETURN: case ST_LOOP: case ST_DEALLOCATION:
+		case ST_FUNCDEF: case ST_EXPR: case ST_ALTARRAYDEF:
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+/**
+ * Whether the analysis below understands an expression.
+ */
+static int knownExprType(ExprType t)
+{
+	switch (t) {
+		case ET_CAST: case ET_CONSTANT: case ET_IDENTIFIER:
+		case ET_FUNCCALL: case ET_OP: case ET_IMPVAR:
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+/**
  * A string that interpolates another variable has to be able to find it by
  * name at run time.
  */
@@ -168,6 +204,10 @@ static void scanConstant(ConstantNode *c)
 static void scanExprUse(ExprNode *expr)
 {
 	if (!expr) return;
+	if (!knownExprType(expr->type)) {
+		analysisPoisoned = 1;
+		return;
+	}
 	switch (expr->type) {
 		case ET_CONSTANT:
 			scanConstant((ConstantNode *)expr->expr);
@@ -212,6 +252,10 @@ static void scanExprUse(ExprNode *expr)
  */
 static void scanStmtDeclare(StmtNode *node)
 {
+	if (!knownStmtType(node->type)) {
+		analysisPoisoned = 1;
+		return;
+	}
 	switch (node->type) {
 		case ST_DECLARATION: {
 			DeclarationStmtNode *s = (DeclarationStmtNode *)node->stmt;
@@ -263,6 +307,10 @@ static void scanBlockDeclare(BlockNode *block)
 
 static void scanStmtUse(StmtNode *node)
 {
+	if (!knownStmtType(node->type)) {
+		analysisPoisoned = 1;
+		return;
+	}
 	switch (node->type) {
 		case ST_CAST:
 			useIdentifier(((CastStmtNode *)node->stmt)->target);
@@ -429,6 +477,10 @@ static void collectFuncDefs(BlockNode *block, FuncDefStmtNode ***out,
 static void collectFuncDefsStmt(StmtNode *node, FuncDefStmtNode ***out,
                                 unsigned int *num, unsigned int *cap)
 {
+	if (!knownStmtType(node->type)) {
+		analysisPoisoned = 1;
+		return;
+	}
 	switch (node->type) {
 		case ST_FUNCDEF: {
 			FuncDefStmtNode *def = (FuncDefStmtNode *)node->stmt;
