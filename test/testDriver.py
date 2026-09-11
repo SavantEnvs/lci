@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 import subprocess
 import sys
 import tempfile
@@ -6,12 +6,18 @@ import argparse
 import os
 
 MEMERR = 127
+
+def show(data):
+  """Renders a program's output for a failure report."""
+  if isinstance(data, bytes):
+    return data.decode("utf-8", "replace")
+  return data
   
 parser = argparse.ArgumentParser(description="Driver for lci tests")
 parser.add_argument('pathToLCI', help="The absolute path the the lci executable")
 parser.add_argument('lolcodeFile', help="The absolute path to the lolcode file to test")
-parser.add_argument('-o', '--outputFile', type=argparse.FileType('r'), default=None, help="The expected output")
-parser.add_argument('-i', '--inputFile', type=argparse.FileType('r'), default=None, help="File to be used as input")
+parser.add_argument('-o', '--outputFile', type=argparse.FileType('rb'), default=None, help="The expected output")
+parser.add_argument('-i', '--inputFile', type=argparse.FileType('rb'), default=None, help="File to be used as input")
 parser.add_argument('-e', '--expectError', action="store_true", help="Specify that an error should occur")
 parser.add_argument('-m', '--memCheck', action='store_true', help="Do a memory check")
 parser.add_argument('-w', '--workingDirectory', default=None, help="Set the working directory")
@@ -41,7 +47,8 @@ if args.memCheck:
 else:
   print("Not doing memory check.")
 
-expectedOutput = ""
+# Read as bytes to match what the program writes.
+expectedOutput = b""
 if args.outputFile != None:
   expectedOutput = args.outputFile.read()
   args.outputFile.close()
@@ -71,8 +78,9 @@ if args.expectError:
   else:
     print("Success!")
     print("Error:")
-    print(results[1])
- 
+    print(show(results[1]))
+    sys.exit(0)
+
 if args.outputFile:
   if p.returncode != 0:
     print("Failure! Return error code: " + str(p.returncode))
@@ -80,12 +88,12 @@ if args.outputFile:
   elif expectedOutput != results[0]:
     print("Expected output didn't match!")
     print("Expected output:")
-    print(expectedOutput)
+    print(show(expectedOutput))
     print("Actual output:")
-    print(results[0])
+    print(show(results[0]))
     sys.exit(1)
   else:
     print("Success!\n\n")
 
-if args.inputFile !=None:
-  args.inputFile
+if args.inputFile != None:
+  args.inputFile.close()

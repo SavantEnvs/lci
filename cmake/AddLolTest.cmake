@@ -1,5 +1,16 @@
 INCLUDE(ParseArguments)
 
+# The test driver is a Python script.  Look the interpreter up rather than
+# assuming a name: "python" is absent on systems that ship only Python 3, and
+# "python3" is absent on older ones.
+IF(NOT LCI_PYTHON)
+  FIND_PROGRAM(LCI_PYTHON NAMES python3 python python2)
+  IF(NOT LCI_PYTHON)
+    MESSAGE(WARNING
+      "No Python interpreter found; the test suite will not be able to run.")
+  ENDIF(NOT LCI_PYTHON)
+ENDIF(NOT LCI_PYTHON)
+
 FUNCTION(ADD_LOL_TEST TEST_NAME)
   PARSE_ARGUMENTS(ARG "LOLCODE;OUTPUT;INPUT" "ERROR;CWD" ${ARGN})
 
@@ -7,7 +18,7 @@ FUNCTION(ADD_LOL_TEST TEST_NAME)
     SET(ARG_LOLCODE ${CMAKE_CURRENT_SOURCE_DIR}/test.lol)
   ENDIF(NOT ARG_LOLCODE)
 
-  SET( TEST_COMMAND python ${CMAKE_SOURCE_DIR}/test/testDriver.py ${CMAKE_BINARY_DIR}/lci ${ARG_LOLCODE} )
+  SET( TEST_COMMAND ${LCI_PYTHON} ${CMAKE_SOURCE_DIR}/test/testDriver.py ${CMAKE_BINARY_DIR}/lci ${ARG_LOLCODE} )
 
   IF(ARG_OUTPUT)
     LIST(APPEND TEST_COMMAND -o=${CMAKE_CURRENT_SOURCE_DIR}/${ARG_OUTPUT})
